@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
+from scipy.optimize import brentq, minimize_scalar
 
 torch.set_default_dtype(torch.float64)
 
@@ -16,18 +17,41 @@ torch.set_default_dtype(torch.float64)
 SCS_TIGHT = {"eps": 1e-8, "max_iters": 100000}
 
 
-def make_data(T, n=50, k=5, seed=0, alpha_std=0.003, noise_std=0.02):
-    """Synthetic panel: factors X (T, n, k), true theta, realised returns r (T, n),
-    proportional costs kappa (5-20 bp) and per-stock trade limits lo < 0 < up."""
+def make_data(T, n=3000, k=5, ic_single=(0.04, 0.08), ic_combined=0.10, ret_vol=0.02,
+              limit_bp=(5, 15), cost_bp=(5, 20), seed=0):
+    """IC-calibrated synthetic panel: factors X (T, n, k), true theta, realised returns r (T, n),
+    proportional costs kappa and per-stock trade limits lo < 0 < up (both in bp of NAV).
+
+    Factors are cross-sectionally N(0, S), S equicorrelated with correlation rho.  With single-factor
+    ICs ic (drawn from `ic_single`), alpha s = X theta and theta = ret_vol * S^-1 ic, every factor has IC
+    ic_j and s has IC sqrt(ic' S^-1 ic); rho is solved (smaller root) so that this equals `ic_combined`.
+    The noise is scaled so that the cross-sectional return volatility is `ret_vol`."""
     g = np.random.default_rng(seed)
-    X = g.standard_normal((T, n, k))
-    theta_star = g.standard_normal(k)
-    theta_star *= alpha_std / np.linalg.norm(theta_star)
-    r = X @ theta_star + noise_std * g.standard_normal((T, n))
-    kappa = g.uniform(5e-4, 2e-3, n)
-    up = g.uniform(0.01, 0.03, n)
-    lo = -g.uniform(0.01, 0.03, n)
+    ic = g.uniform(*ic_single, k) if np.ndim(ic_single) else np.full(k, ic_single)
+    S = lambda rho: (1 - rho) * np.eye(k) + rho * np.ones((k, k))
+    combined = lambda rho: np.sqrt(ic @ np.linalg.solve(S(rho), ic)) - ic_combined
+    # combined IC blows up at both ends of the valid range (S singular); take the root below its minimum
+    lo_rho = -1 / (k - 1) + 1e-6
+    rho_min = minimize_scalar(combined, bounds=(lo_rho, 1 - 1e-6), method="bounded").x
+    if combined(rho_min) > 0:
+        raise ValueError(f"combined IC {ic_combined} is below what these single ICs give ({combined(rho_min) + ic_combined:.3f})")
+    rho = brentq(combined, lo_rho, rho_min)
+    X = g.standard_normal((T, n, k)) @ np.linalg.cholesky(S(rho)).T
+    theta_star = ret_vol * np.linalg.solve(S(rho), ic)
+    r = X @ theta_star + ret_vol * np.sqrt(1 - ic_combined ** 2) * g.standard_normal((T, n))
+    kappa = g.uniform(*cost_bp, n) * 1e-4
+    up = g.uniform(*limit_bp, n) * 1e-4
+    lo = -g.uniform(*limit_bp, n) * 1e-4
     return X, theta_star, r, kappa, lo, up
+
+
+def ic(F, r, rank=False):
+    """Mean over dates of the cross-sectional (Pearson or rank) correlation of F (T, n) with r (T, n)."""
+    if rank:
+        F, r = F.argsort(1).argsort(1).astype(float), r.argsort(1).argsort(1).astype(float)
+    F = F - F.mean(1, keepdims=True)
+    r = r - r.mean(1, keepdims=True)
+    return ((F * r).sum(1) / np.sqrt((F ** 2).sum(1) * (r ** 2).sum(1))).mean()
 
 
 def lp_highs(C, kappa, lo, up):
@@ -50,24 +74,22 @@ def lp_exact(C, kappa, lo, up):
     breakpoints until sum(w) reaches 0; the asset at that breakpoint takes the fractional amount."""
     C = np.atleast_2d(C)
     T, n = C.shape
-    W = np.empty((T, n))
-    for t, c in enumerate(C):
-        bp = np.r_[c + kappa, c - kappa]            # breakpoints, lo->0 then 0->up
-        jump = np.r_[-lo, up]                         # increase of sum(w) when mu passes below
-        order = np.argsort(-bp, kind="stable")
-        total = lo.sum() + np.cumsum(jump[order])     # sum(w) just below each breakpoint
-        j = np.searchsorted(total, 0.0)               # first breakpoint where sum(w) >= 0
-        w = lo.copy()
-        for idx in order[:j]:                         # fully passed breakpoints
-            i = idx % n
-            w[i] = 0.0 if idx < n else up[i]
-        i = order[j] % n                              # marginal asset closes the budget exactly
-        w[i] -= (total[j - 1] if j > 0 else lo.sum())
-        W[t] = w
+    rows = np.arange(T)
+    bp = np.concatenate([C + kappa, C - kappa], 1)          # breakpoints: lo->0, then 0->up
+    jump = np.r_[-lo, up]                                     # increase of sum(w) when mu passes below
+    order = np.argsort(-bp, axis=1, kind="stable")
+    total = lo.sum() + np.cumsum(jump[order], axis=1)         # sum(w) just below each breakpoint
+    j = (total < 0).sum(1)                                    # first breakpoint where sum(w) >= 0
+    rank = np.empty_like(order)
+    np.put_along_axis(rank, order, np.broadcast_to(np.arange(2 * n), order.shape), axis=1)
+    passed = rank < j[:, None]                                # breakpoints passed completely
+    W = np.where(passed[:, n:], up, np.where(passed[:, :n], 0.0, lo))
+    marginal = order[rows, j] % n                             # this asset closes the budget exactly
+    W[rows, marginal] -= np.where(j > 0, total[rows, np.maximum(j - 1, 0)], lo.sum())
     return W
 
 
-def qp_exact(C, kappa, eta, lo, up, iters=200):
+def qp_exact(C, kappa, eta, lo, up, iters=100):
     """Closed-form QP decisions: w_i = clip(soft(c_i - mu, kappa_i) / eta_i, lo_i, up_i),
     with the multiplier mu of sum(w) = 0 found by bisection and then solved exactly on the free set.
     Returns W (T, n) and the free-set mask (assets that are neither 0 nor at a bound)."""

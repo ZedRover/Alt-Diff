@@ -4,7 +4,8 @@ Same recursion as numerical_experiment/opt_layer.py and classification/newlayer.
 changes that matter here:
   * forward-mode tangents are taken w.r.t. theta directly (k columns) instead of the full dz/dq,
   * the whole batch of dates is solved at once and P + rho(A'A + G'G) is factored once,
-  * stopping uses primal/dual residuals plus an iteration cap, and rho is a parameter.
+  * stopping uses primal/dual residuals plus an iteration cap, and rho is a parameter,
+  * altdiff_box exploits the box/budget structure so that a step is O(n) (n = 3000 is fine).
 """
 import torch
 
@@ -60,15 +61,64 @@ def split_problem(kappa, lo, up, eta=None):
     return P, A, b, G, h
 
 
-def altdiff_portfolio(theta, X, kappa, lo, up, eta=None, **kw):
-    """Decisions w (T, n) for c = X theta and their Jacobian dw/dtheta (T, n, k)."""
+def altdiff_box(q, dq, eta2, ub, rho=0.1, max_iter=20000, tol=1e-12, check_every=10):
+    """altdiff_qp specialised to split_problem():  min 0.5 z'diag(eta2)z + q'z  s.t.  a'z = 0,
+    0 <= z <= ub  with a = [1; -1] and G = [I; -I].  G z = [z; -z], G'v = v_top - v_bottom and
+    P + rho(aa' + G'G) = diag(eta2 + 2 rho) + rho aa' is inverted with Sherman-Morrison, so each step
+    costs O(T d k) instead of O(T d^2 k).  The iterates are the same as altdiff_qp's."""
+    T, d = q.shape
+    k = dq.shape[-1]
+    a = torch.cat([q.new_ones(d // 2), -q.new_ones(d // 2)])
+    Dinv = 1 / (eta2 + 2 * rho)
+    Da = Dinv * a
+    coef = rho / (1 + rho * (a * Da).sum())
+    R2 = lambda v: -(Dinv * v - Da * (coef * (v @ Da))[:, None])
+    R3 = lambda V: -(Dinv[:, None] * V - Da[:, None] * (coef * torch.einsum("d,tdk->tk", Da, V))[:, None, :])
+    Gt = lambda v: v[:, :d] - v[:, d:]
+    G = lambda v: torch.cat([v, -v], 1)
+    h = torch.cat([ub, torch.zeros_like(ub)])
+    z, lam = q.new_zeros(T, d), q.new_zeros(T)
+    s, nu = q.new_zeros(T, 2 * d), q.new_zeros(T, 2 * d)
+    dz, dlam = torch.zeros_like(dq), dq.new_zeros(T, k)
+    ds, dnu = dq.new_zeros(T, 2 * d, k), dq.new_zeros(T, 2 * d, k)
+    for it in range(1, max_iter + 1):
+        z = R2(q + lam[:, None] * a + Gt(nu) + rho * Gt(s) - rho * ub)
+        dz = R3(dq + a[None, :, None] * dlam[:, None, :] + Gt(dnu) + rho * Gt(ds))
+        Gz, Gdz = G(z), G(dz)
+        s_new = torch.relu(-nu / rho - (Gz - h))
+        ds = -(1 / rho) * (s_new > 0).to(dq.dtype)[..., None] * (dnu + rho * Gdz)
+        lam = lam + rho * (z @ a)
+        dlam = dlam + rho * torch.einsum("d,tdk->tk", a, dz)
+        nu = nu + rho * (Gz + s_new - h)
+        dnu = dnu + rho * (Gdz + ds)
+        if it % check_every == 0:
+            r_prim = max((z @ a).abs().max().item(), (Gz + s_new - h).abs().max().item())
+            r_dual = rho * Gt(s_new - s).abs().max().item()
+            if max(r_prim, r_dual) < tol:
+                s = s_new
+                break
+        s = s_new
+    return z, dz, it
+
+
+def altdiff_portfolio(theta, X, kappa, lo, up, eta=None, dense=False, **kw):
+    """Decisions w (T, n) for c = X theta and their Jacobian dw/dtheta (T, n, k).
+    dense=True runs the generic altdiff_qp on the same problem (for checking; O(n^2) per step)."""
     n = X.shape[1]
     c = X @ theta
-    P, A, b, G, h = split_problem(kappa, lo, up, eta)
     q = torch.cat([kappa - c, kappa + c], 1)
     dq = torch.cat([-X, X], 1)
-    z, dz, it = altdiff_qp(P, q, dq, A, b, G, h, **kw)
+    if dense:
+        z, dz, it = altdiff_qp(*_dense_args(q, dq, kappa, lo, up, eta), **kw)
+    else:
+        eta2 = torch.zeros(2 * n) if eta is None else torch.as_tensor(eta).expand(n).repeat(2)
+        z, dz, it = altdiff_box(q, dq, eta2, torch.cat([up.clamp(min=0), (-lo).clamp(min=0)]), **kw)
     return z[:, :n] - z[:, n:], dz[:, :n] - dz[:, n:], it
+
+
+def _dense_args(q, dq, kappa, lo, up, eta):
+    P, A, b, G, h = split_problem(kappa, lo, up, eta)
+    return P, q, dq, A, b, G, h
 
 
 class AltDiffLayer(torch.autograd.Function):

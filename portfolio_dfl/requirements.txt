@@ -1,0 +1,12 @@
+# Tested together on Python 3.11, CPU.  qpth 0.0.18 requires numpy<2, which rules out the
+# numpy>=2 releases of cvxpylayers (>=1.1) / diffcp (>=1.1); these versions install together.
+torch==2.14.0
+numpy==1.26.4
+scipy==1.17.1
+cvxpy==1.7.5
+cvxpylayers==0.1.6
+diffcp==1.0.23
+scs==3.3.1
+clarabel==0.11.1
+highspy==1.15.1
+qpth==0.0.18
